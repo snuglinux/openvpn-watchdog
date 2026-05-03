@@ -1,0 +1,11 @@
+[Unit]
+Description=Run OpenVPN Watchdog periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=openvpn-watchdog.service
+
+[Install]
+WantedBy=timers.target

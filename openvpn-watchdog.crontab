@@ -1,0 +1,2 @@
+# Run OpenVPN Watchdog every minute on non-systemd systems.
+* * * * * root /usr/bin/openvpn-watchdog >/dev/null 2>&1

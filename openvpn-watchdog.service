@@ -1,0 +1,9 @@
+[Unit]
+Description=OpenVPN Watchdog
+Documentation=https://github.com/snuglinux/openvpn-watchdog
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/openvpn-watchdog
