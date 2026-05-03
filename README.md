@@ -2,54 +2,37 @@
 
 [🇺🇦 Українська версія / Ukrainian version](README_uk.md)
 
-**openvpn-watchdog** is a small and predictable watchdog for OpenVPN.  It can monitor multiple OpenVPN profiles at the same time and restart only the profile whose service or VPN connectivity check has failed.
+**openvpn-watchdog** is a small and predictable Bash watchdog for OpenVPN. It monitors multiple OpenVPN `CLIENT` and `SERVER` profiles and restarts only the OpenVPN service where a problem was detected.
 
-> Important: this package **does not reboot the computer**.  Automatic host reboot logic should live in a separate watchdog package, so OpenVPN monitoring and whole-machine health monitoring stay cleanly separated.
+> Important: this package **does not reboot the computer**. Automatic host reboot logic is planned as a separate watchdog package, so OpenVPN monitoring and whole-machine health monitoring stay cleanly separated.
 
 ---
 
-## Why this tool exists
+## What changed in 0.2.0
 
-OpenVPN failures are not always the same:
-
-- a systemd service may stop or enter the `failed` state;
-- a client service may still be `active`, while the tunnel itself no longer works;
-- one VPN profile may be broken while other profiles continue to work normally;
-- an OpenVPN server may be healthy even when no VPN client is currently connected.
-
-`openvpn-watchdog` keeps the rules simple and easy to understand:
-
-| Profile type | What is checked | When restart is triggered |
-|---|---|---|
-| `SERVER` | systemd service only | when the service is not `active` |
-| `CLIENT` without `ping=` | systemd service only | when the service is not `active` |
-| `CLIENT` with `ping=` | systemd service + VPN ping target | when the service is not `active`, or when the VPN ping target is unavailable for several cycles |
-
-There is no separate `check=` option.  The behavior is derived from `type` and optional `ping`, which keeps the configuration clear.
+- Multiple OpenVPN `CLIENT` and `SERVER` profiles.
+- `SERVER` profiles are checked by systemd service state only.
+- `CLIENT` profiles are checked by systemd service state and optional VPN-side ICMP `ping=` targets.
+- Global `INTERNET_CHECK` can use HTTP(S) through `curl`, which is useful when ICMP is blocked by a provider or firewall.
+- English/Ukrainian interface messages.
+- English/Ukrainian notification hook message variables.
+- Structured event log for future log analysis and Email/Matrix notifications.
+- `--dry-run` mode is read-only and does not update persistent counters.
+- Replaces the deprecated `auto-restart-openvpn` package.
 
 ---
 
 ## Core logic
 
-### `SERVER`
+| Profile type | What is checked | When restart is triggered |
+|---|---|---|
+| `SERVER` | systemd service only | when the service is not `active` |
+| `CLIENT` without `ping=` | systemd service only | when the service is not `active` |
+| `CLIENT` with `ping=` | systemd service + VPN-side ICMP ping | when the service is not `active`, or when all configured ping targets are unavailable for several cycles |
 
-For server profiles, the watchdog checks only the systemd service:
+There is no separate `check=` option. Behavior is derived from `type` and optional `ping=`, which keeps the configuration clear.
 
-```bash
-systemctl is-active openvpn-server@main-server.service
-```
-
-A server profile is **not required to pass a ping check**.  An OpenVPN server may be working correctly even when no client is connected, or when the VPN-side address is not reachable from the local context.
-
-### `CLIENT`
-
-For client profiles, service status alone is often not enough.  For example:
-
-```text
-openvpn-client@office-client.service = active
-```
-
-but the VPN tunnel may still be broken.  For that reason, a client profile may define `ping=` — one or more VPN-side addresses that should answer when the tunnel is healthy.
+HTTP(S)/`curl` checks are **not** used for VPN client profiles. They are supported only by the global `INTERNET_CHECK` block.
 
 ---
 
@@ -64,6 +47,8 @@ Configuration file:
 Example:
 
 ```bash
+OPENVPN_WATCHDOG_LANGUAGE="auto"
+
 OPENVPN_PROFILES=(
     "name=office type=CLIENT ping=10.8.0.1 restart_cycles=3"
     "name=branch type=CLIENT ping=10.9.0.1,10.9.0.2 restart_cycles=3"
@@ -86,33 +71,7 @@ For standard OpenVPN systemd units, the service name is generated automatically:
 | `SERVER` | `openvpn-server@<name>-server.service` |
 | `CLIENT` | `openvpn-client@<name>-client.service` |
 
-Example:
-
-```bash
-"name=office type=CLIENT ping=10.8.0.1"
-```
-
-checks:
-
-```bash
-openvpn-client@office-client.service
-```
-
-And:
-
-```bash
-"name=main type=SERVER"
-```
-
-checks:
-
-```bash
-openvpn-server@main-server.service
-```
-
 ### `type`
-
-OpenVPN profile type.
 
 Allowed values:
 
@@ -121,74 +80,130 @@ SERVER
 CLIENT
 ```
 
-The logic is intentionally simple:
+Simple behavior:
 
 ```text
 SERVER -> systemd service only
-CLIENT -> systemd service + ping, if ping is configured
+CLIENT -> systemd service + ping target if configured
 ```
 
 ### `ping`
 
-Optional parameter.  It is mainly useful for `CLIENT` profiles.
-
-Single target:
+Optional ICMP target list. This is the only VPN-side connectivity check supported for `CLIENT` profiles.
 
 ```bash
 ping=10.8.0.1
-```
-
-Multiple targets, separated by commas:
-
-```bash
 ping=10.8.0.1,10.8.0.2
 ```
 
-If multiple targets are configured, at least one successful reply is enough to consider the VPN check healthy.
+If several targets are configured, at least one successful reply is enough.
 
-For `SERVER` profiles, `ping=` is normally not needed and should usually be omitted.
+For `SERVER` profiles, `ping=` is ignored because an OpenVPN server can be healthy even when no clients are connected.
 
 ### `restart_cycles`
 
-Number of failed VPN ping cycles for a `CLIENT` profile before the OpenVPN service is restarted.
+Number of failed `CLIENT` ping cycles before the service is restarted.
 
 ```bash
 restart_cycles=3
 ```
 
-This means: if the VPN target is unavailable for 3 consecutive watchdog runs, restart the related OpenVPN client service.
-
-> If the systemd service itself is not `active`, restart is performed immediately and does not wait for `restart_cycles`.
+If the systemd service itself is not `active`, restart is performed immediately and does not wait for `restart_cycles`.
 
 ### `service`
 
-Optional parameter for non-standard systemd service names.
+Optional exact systemd service name for non-standard OpenVPN units.
 
 ```bash
 "name=office type=CLIENT service=openvpn-client@office.service ping=10.8.0.1 restart_cycles=3"
 ```
 
-If `service=` is set, the watchdog uses that exact service name instead of generating one automatically.
-
 ---
 
 ## Internet availability guard
 
-For client VPN profiles, the watchdog can avoid unnecessary restarts when the whole host has no internet access.
+For client VPN profiles, the watchdog can avoid unnecessary restarts when the whole host has no Internet access.
 
-Example settings:
+Some providers/firewalls block ICMP. For this reason `INTERNET_CHECK` can use HTTP(S) with `curl`, for example:
+
+```bash
+curl -4 -I --connect-timeout 8 https://google.com
+```
+
+Configuration:
 
 ```bash
 INTERNET_CHECK_ENABLED="YES"
+INTERNET_CHECK_METHOD="auto"
+HTTP_SERVER_INT="https://google.com,https://cloudflare.com"
 PING_SERVER_INT="8.8.8.8,1.1.1.1"
 SKIP_CLIENT_PING_WHEN_INTERNET_DOWN="YES"
 ```
 
-When internet access is down:
+`INTERNET_CHECK_METHOD` supports:
+
+| Method | Behavior |
+|---|---|
+| `auto` | try HTTP(S) first, then ping |
+| `http` | use only HTTP(S) checks through `curl` |
+| `ping` | use only ICMP ping checks |
+
+HTTP settings used by the Internet check:
+
+```bash
+HTTP_CONNECT_TIMEOUT=8
+HTTP_MAX_TIME=12
+HTTP_IP_VERSION="4"        # 4, 6, or auto
+HTTP_REQUEST_METHOD="HEAD" # HEAD or GET
+```
+
+When Internet access is down:
 
 - OpenVPN systemd service states are still checked;
-- client VPN ping checks may be skipped;
-- this prevents restarting all OpenVPN clients just because the upstream internet link is unavailable.
+- VPN client ping checks may be skipped;
+- this prevents restarting all OpenVPN clients because the upstream Internet link is unavailable.
+
+---
+
+## Language and external translation files
+
+The interface language can be configured globally:
+
+```bash
+OPENVPN_WATCHDOG_LANGUAGE="auto"
+OPENVPN_WATCHDOG_LOCALE_DIR="/usr/share/openvpn-watchdog/locale"
+```
+
+Supported language values:
+
+```bash
+auto
+en
+uk
+```
+
+Translation files are stored outside the main script:
+
+```text
+/usr/share/openvpn-watchdog/locale/en.conf
+/usr/share/openvpn-watchdog/locale/uk.conf
+```
+
+When running from a source checkout, the script automatically uses local files from:
+
+```text
+./locale/en.conf
+./locale/uk.conf
+```
+
+This keeps the watchdog logic separate from user-facing text and makes future translations easier to add.
+
+The language can also be set for a single run:
+
+```bash
+sudo openvpn-watchdog --language uk --dry-run
+sudo openvpn-watchdog --language en --dry-run
+```
 
 ---
 
@@ -209,16 +224,52 @@ Structured event log:
 Example event log line:
 
 ```text
-2026-05-03T13:15:01+0300 severity=WARNING profile=office type=CLIENT service=openvpn-client@office-client.service event=vpn_ping_unavailable message=VPN target is unavailable: 10.8.0.1. Failure cycle: 1/3
+2026-05-03T13:15:01+0300 severity=WARNING profile=office type=CLIENT service=openvpn-client@office-client.service event=vpn_ping_unavailable language=en message=VPN ping target is unavailable: ping=10.8.0.1. Failure cycle: 1/3
 ```
 
 The event log is intentionally structured so it can later be analyzed by another script or forwarded to Matrix, Email, Zabbix, or another monitoring system.
 
 ---
 
+## Notification hook foundation
+
+The main script can call a notification hook:
+
+```bash
+NOTIFICATIONS_ENABLED="YES"
+NOTIFY_SCRIPT="/usr/local/bin/openvpn-watchdog-notify.sh"
+```
+
+The hook receives active-language text and translated variants:
+
+```bash
+OPENVPN_WATCHDOG_TIME
+OPENVPN_WATCHDOG_SEVERITY
+OPENVPN_WATCHDOG_PROFILE
+OPENVPN_WATCHDOG_TYPE
+OPENVPN_WATCHDOG_SERVICE
+OPENVPN_WATCHDOG_EVENT
+OPENVPN_WATCHDOG_LANGUAGE
+OPENVPN_WATCHDOG_MESSAGE
+OPENVPN_WATCHDOG_MESSAGE_EN
+OPENVPN_WATCHDOG_MESSAGE_UK
+OPENVPN_WATCHDOG_LOG_FILE
+OPENVPN_WATCHDOG_EVENT_LOG
+```
+
+This allows future Email/Matrix hooks to choose the message language without parsing logs.
+
+Example hook:
+
+```bash
+examples/openvpn-watchdog-notify.example.sh
+```
+
+---
+
 ## Basic journalctl analysis
 
-The configuration already contains a foundation for future problem analysis:
+The configuration already includes initial log analysis settings:
 
 ```bash
 LOG_ANALYSIS_ENABLED="YES"
@@ -229,58 +280,11 @@ LOG_ANALYSIS_PATTERNS="AUTH_FAILED|TLS Error|Inactivity timeout|Connection reset
 
 Current behavior:
 
-- when a service or ping problem is detected;
-- the watchdog reads recent `journalctl` lines for the affected service;
-- it searches for common OpenVPN error patterns;
-- it writes additional structured events such as `log_pattern_detected`.
+- when a service or VPN ping problem is detected;
+- watchdog checks recent `journalctl` lines for the affected service;
+- common OpenVPN errors are written as structured events.
 
-Log analysis currently **does not make independent restart decisions**.  It only records useful diagnostic information for troubleshooting and future notifications.
-
----
-
-## Notification hook for Email / Matrix
-
-The configuration includes a hook for future notifications:
-
-```bash
-NOTIFICATIONS_ENABLED="NO"
-NOTIFY_SCRIPT=""
-```
-
-Later it can be enabled like this:
-
-```bash
-NOTIFICATIONS_ENABLED="YES"
-NOTIFY_SCRIPT="/usr/local/bin/openvpn-watchdog-notify.sh"
-```
-
-The hook receives these environment variables:
-
-```bash
-OPENVPN_WATCHDOG_TIME
-OPENVPN_WATCHDOG_SEVERITY
-OPENVPN_WATCHDOG_PROFILE
-OPENVPN_WATCHDOG_TYPE
-OPENVPN_WATCHDOG_SERVICE
-OPENVPN_WATCHDOG_EVENT
-OPENVPN_WATCHDOG_MESSAGE
-OPENVPN_WATCHDOG_LOG_FILE
-OPENVPN_WATCHDOG_EVENT_LOG
-```
-
-This makes it possible to implement separate integrations for:
-
-- Email notifications;
-- Matrix notifications;
-- monitoring systems;
-- repeated-error analysis;
-- escalation rules for critical OpenVPN failures.
-
-An example hook script is included:
-
-```bash
-examples/openvpn-watchdog-notify.example.sh
-```
+Log analysis does **not** make restart decisions yet. It only collects diagnostic information for future alerts and analysis.
 
 ---
 
@@ -290,16 +294,18 @@ examples/openvpn-watchdog-notify.example.sh
 sudo ./install.sh
 ```
 
-The installer places files here:
+The script installs:
 
 ```text
 /usr/bin/openvpn-watchdog
 /etc/openvpn-watchdog.conf
 /etc/systemd/system/openvpn-watchdog.service
 /etc/systemd/system/openvpn-watchdog.timer
+/usr/share/openvpn-watchdog/locale/en.conf
+/usr/share/openvpn-watchdog/locale/uk.conf
 ```
 
-If systemd is not available, it installs a cron file instead:
+If systemd is not found, it installs a cron file instead:
 
 ```text
 /etc/cron.d/openvpn-watchdog
@@ -311,96 +317,55 @@ Existing `/etc/openvpn-watchdog.conf` is not overwritten.
 
 ## Dry run
 
-Run without restarting services or calling notification hooks:
-
 ```bash
 sudo openvpn-watchdog --dry-run
 ```
 
-In dry-run mode, the watchdog:
+In this mode the watchdog:
 
 - reads the configuration;
 - checks profiles;
-- writes logs;
+- prints logs to stdout;
 - does **not** restart services;
-- does **not** call the notification hook.
+- does **not** call the notification hook;
+- does **not** update persistent counters.
 
 ---
 
-## Manual run and diagnostics
+## Arch Linux package
 
-Run manually:
+Packaging files are included:
 
-```bash
-sudo openvpn-watchdog
+```text
+packaging/arch/PKGBUILD
+packaging/arch/openvpn-watchdog.install
 ```
 
-Check the timer:
+Build:
 
 ```bash
-systemctl status openvpn-watchdog.timer
+cd packaging/arch
+updpkgsums
+makepkg --printsrcinfo > .SRCINFO
+makepkg -s
 ```
 
-View recent service logs:
-
-```bash
-journalctl -u openvpn-watchdog.service -n 100 --no-pager
-```
+`openvpn-watchdog` replaces the deprecated `auto-restart-openvpn` package.
 
 ---
 
-## Migration from the old `auto-restart-openvpn`
+## ClearOS / CentOS 7 RPM package
 
-The old configuration was tied to a single profile:
+RPM spec file:
 
-```bash
-NAME_SERVICE='client_openvpn'
-TYPE='CLIENT'
-PING_SERVER_VPN='10.8.0.1'
+```text
+packaging/rpm/openvpn-watchdog.spec
 ```
 
-New configuration:
+Source tarball for version `0.2.0`:
 
-```bash
-OPENVPN_PROFILES=(
-    "name=client_openvpn type=CLIENT ping=10.8.0.1 restart_cycles=3"
-)
+```text
+https://github.com/snuglinux/openvpn-watchdog/archive/refs/tags/0.2.0.tar.gz
 ```
 
-Old server-style configuration:
-
-```bash
-NAME_SERVICE='main'
-TYPE='SERVER'
-```
-
-New configuration:
-
-```bash
-OPENVPN_PROFILES=(
-    "name=main type=SERVER restart_cycles=3"
-)
-```
-
----
-
-## What was intentionally removed
-
-This package no longer contains:
-
-- automatic computer reboot logic;
-- `REBOOT_AFTER_CYCLES`;
-- `AUTOMATION_SCRIPT` execution before reboot.
-
-That functionality should be implemented later as a separate host/system watchdog package.
-
----
-
-## Recommended future development
-
-1. A separate reboot/system watchdog package.
-2. A dedicated Matrix notification hook.
-3. A dedicated Email notification hook.
-4. A parser/analyzer for `/var/log/openvpn-watchdog/events.log`.
-5. Threshold rules, for example: if `AUTH_FAILED` repeats N times, send a critical notification.
-6. Optional integration with monitoring systems such as Zabbix, Prometheus exporters, or custom health dashboards.
+The RPM package obsoletes/replaces the deprecated `auto-restart-openvpn` package.

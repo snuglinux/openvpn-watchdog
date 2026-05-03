@@ -1,0 +1,51 @@
+# Maintainer: snuglinux <https://github.com/snuglinux>
+
+pkgname=openvpn-watchdog
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Watchdog for multiple OpenVPN profiles with external multilingual message files'
+arch=('any')
+url='https://github.com/snuglinux/openvpn-watchdog'
+license=('custom')
+depends=('bash' 'curl' 'openvpn' 'systemd')
+conflicts=('auto-restart-openvpn')
+replaces=('auto-restart-openvpn')
+provides=('openvpn-watchdog' 'auto-restart-openvpn')
+backup=('etc/openvpn-watchdog.conf')
+install='openvpn-watchdog.install'
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+# IMPORTANT:
+# Replace sha256sums=('SKIP') before publishing to a repository/AUR:
+#   updpkgsums
+#   makepkg --printsrcinfo > .SRCINFO
+
+package() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+
+    install -Dm755 openvpn-watchdog "${pkgdir}/usr/bin/openvpn-watchdog"
+    install -Dm644 openvpn-watchdog.conf "${pkgdir}/etc/openvpn-watchdog.conf"
+
+    install -Dm644 openvpn-watchdog.service "${pkgdir}/usr/lib/systemd/system/openvpn-watchdog.service"
+    install -Dm644 openvpn-watchdog.timer "${pkgdir}/usr/lib/systemd/system/openvpn-watchdog.timer"
+
+    if [[ -d locale ]]; then
+        install -dm755 "${pkgdir}/usr/share/openvpn-watchdog/locale"
+        install -Dm644 locale/*.conf "${pkgdir}/usr/share/openvpn-watchdog/locale/"
+    fi
+
+    # Cron is provided as documentation only.  Arch Linux uses the systemd timer.
+    install -Dm644 openvpn-watchdog.crontab "${pkgdir}/usr/share/doc/openvpn-watchdog/openvpn-watchdog.crontab.example"
+
+    install -Dm644 README.md "${pkgdir}/usr/share/doc/openvpn-watchdog/README.md"
+    if [[ -f README_uk.md ]]; then
+        install -Dm644 README_uk.md "${pkgdir}/usr/share/doc/openvpn-watchdog/README_uk.md"
+    fi
+    if [[ -f examples/openvpn-watchdog-notify.example.sh ]]; then
+        install -Dm755 examples/openvpn-watchdog-notify.example.sh "${pkgdir}/usr/share/doc/openvpn-watchdog/examples/openvpn-watchdog-notify.example.sh"
+    fi
+
+    install -dm755 "${pkgdir}/var/log/openvpn-watchdog"
+    install -dm755 "${pkgdir}/var/lib/openvpn-watchdog"
+}

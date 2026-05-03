@@ -1,0 +1,73 @@
+#!/bin/bash
+
+_legacy_name='auto-restart-openvpn'
+_new_name='openvpn-watchdog'
+_legacy_conf="/etc/${_legacy_name}.conf"
+_legacy_backup="/etc/${_legacy_name}.conf.${_new_name}-migration-backup"
+
+_disable_legacy_auto_restart_openvpn() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "${_legacy_name}.timer" >/dev/null 2>&1 || true
+        systemctl disable --now "${_legacy_name}.service" >/dev/null 2>&1 || true
+    fi
+
+    if [[ -f "${_legacy_conf}" && ! -f "${_legacy_backup}" ]]; then
+        cp -a "${_legacy_conf}" "${_legacy_backup}" 2>/dev/null || true
+    fi
+
+    # Remove leftovers from the old manual installer.  If the old package is
+    # managed by pacman, the package replacement/conflict metadata handles it.
+    rm -f \
+        "/usr/bin/${_legacy_name}" \
+        "/etc/cron.d/${_legacy_name}" \
+        "/etc/systemd/system/${_legacy_name}.service" \
+        "/etc/systemd/system/${_legacy_name}.timer" \
+        "/usr/lib/systemd/system/${_legacy_name}.service" \
+        "/usr/lib/systemd/system/${_legacy_name}.timer"
+}
+
+post_install() {
+    _disable_legacy_auto_restart_openvpn
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable --now openvpn-watchdog.timer >/dev/null 2>&1 || true
+    fi
+
+    cat <<MSG
+openvpn-watchdog installed.
+
+The deprecated auto-restart-openvpn package is replaced by openvpn-watchdog.
+If an old config existed, a migration backup may be available here:
+  ${_legacy_backup}
+
+Edit the new config:
+  /etc/openvpn-watchdog.conf
+
+Test safely:
+  sudo openvpn-watchdog --dry-run
+MSG
+}
+
+pre_upgrade() {
+    _disable_legacy_auto_restart_openvpn
+}
+
+post_upgrade() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl try-restart openvpn-watchdog.timer >/dev/null 2>&1 || true
+    fi
+}
+
+pre_remove() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now openvpn-watchdog.timer >/dev/null 2>&1 || true
+    fi
+}
+
+post_remove() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}

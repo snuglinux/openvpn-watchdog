@@ -3,51 +3,162 @@
 # openvpn-watchdog
 # ----------------
 # Watches one or more OpenVPN systemd profiles and restarts only the broken
-# OpenVPN service.  It does NOT reboot the computer.  Machine reboot logic is
-# intentionally left for a separate package/service.
+# OpenVPN service. It does NOT reboot the computer. Machine reboot logic is
+# planned as a separate package/service.
 #
 # Main rules:
 #   * SERVER profiles: check only the systemd service state.
-#   * CLIENT profiles: check the systemd service state, then optionally ping
-#     one or more VPN-side addresses if "ping=" is configured.
+#   * CLIENT profiles: check the systemd service state, then optionally check
+#     VPN-side connectivity by ICMP ping= targets only.
 #
-# The script also writes a structured event log and can call an optional
-# notification hook.  This keeps the current package simple while preparing a
-# clean path for future Email/Matrix notifications and log analysis.
+# Internet checks can use ping, HTTP(S) via curl, or auto mode. This is useful
+# when an ISP/firewall blocks ICMP but HTTPS connectivity still works.
+#
+# The script writes structured event logs and can call a notification hook.
+# User-facing messages and notification text support English and Ukrainian.
+#
+# Dry-run mode is intentionally read-only: it does not restart services, does
+# not call notification hooks, and does not update persistent state counters.
 
 set -o pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 SCRIPT_NAME="$(basename "$0")"
 DEFAULT_CONFIG_FILE="/etc/openvpn-watchdog.conf"
 CONFIG_FILE="${OPENVPN_WATCHDOG_CONFIG:-$DEFAULT_CONFIG_FILE}"
 DRY_RUN="NO"
 
 # -----------------------------------------------------------------------------
+# Language and user-interface helpers
+# -----------------------------------------------------------------------------
+# User-facing messages are intentionally kept outside this script. Translation
+# files are installed into /usr/share/openvpn-watchdog/locale/ and can also be
+# used directly from ./locale/ when running the project from a source checkout.
+#
+# Supported languages:
+#   auto - detect from LANG/LC_ALL/LC_MESSAGES;
+#   en   - English;
+#   uk   - Ukrainian.
+#
+# The notification hook receives active-language text plus English/Ukrainian
+# variants. This keeps future Email/Matrix integrations simple and predictable.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+DEFAULT_LOCALE_DIR="/usr/share/openvpn-watchdog/locale"
+OPENVPN_WATCHDOG_LOCALE_DIR="${OPENVPN_WATCHDOG_LOCALE_DIR:-}"
+OPENVPN_WATCHDOG_LANGUAGE="${OPENVPN_WATCHDOG_LANGUAGE:-auto}"
+ACTIVE_LANGUAGE="en"
+CLI_LANGUAGE_SET="NO"
+
+normalize_language() {
+    local value="${1:-auto}"
+    value="${value,,}"
+
+    if [ "$value" = "auto" ] || [ -z "$value" ]; then
+        value="${LC_ALL:-${LC_MESSAGES:-${LANG:-en}}}"
+        value="${value,,}"
+    fi
+
+    case "$value" in
+        uk|uk_*|uk.*|ua|ua_*|ua.*)
+            printf 'uk'
+            ;;
+        *)
+            printf 'en'
+            ;;
+    esac
+}
+
+set_active_language() {
+    ACTIVE_LANGUAGE="$(normalize_language "${1:-auto}")"
+}
+
+# Return the directory that contains translation files.  The explicit
+# OPENVPN_WATCHDOG_LOCALE_DIR value has priority.  When running from a Git
+# checkout, ./locale is used automatically.  Installed packages use
+# /usr/share/openvpn-watchdog/locale.
+get_locale_dir() {
+    if [ -n "${OPENVPN_WATCHDOG_LOCALE_DIR:-}" ]; then
+        printf '%s' "$OPENVPN_WATCHDOG_LOCALE_DIR"
+    elif [ -d "${SCRIPT_DIR}/locale" ]; then
+        printf '%s' "${SCRIPT_DIR}/locale"
+    else
+        printf '%s' "$DEFAULT_LOCALE_DIR"
+    fi
+}
+
+locale_file_for_lang() {
+    local lang="$(normalize_language "${1:-en}")"
+    printf '%s/%s.conf' "$(get_locale_dir)" "$lang"
+}
+
+# Read a message template from the selected external locale file.
+# Locale files define variables named I18N_<key>.  If a translated key is
+# missing, English is used as fallback.  If even English is missing, the key
+# itself is returned so the caller still gets a useful diagnostic string.
+message_template() {
+    local lang="$1"
+    local key="$2"
+    local file
+    local var_name
+    local template=""
+
+    lang="$(normalize_language "$lang")"
+    file="$(locale_file_for_lang "$lang")"
+    var_name="I18N_${key}"
+
+    if [ -f "$file" ]; then
+        # shellcheck disable=SC1090
+        template="$({ source "$file"; printf '%s' "${!var_name:-}"; } 2>/dev/null || true)"
+    fi
+
+    if [ -z "$template" ] && [ "$lang" != "en" ]; then
+        message_template "en" "$key"
+        return
+    fi
+
+    if [ -z "$template" ]; then
+        case "$key" in
+            error_option_requires_value) printf '%s' 'ERROR: %s requires a value' ;;
+            error_unknown_argument) printf '%s' 'ERROR: unknown argument: %s' ;;
+            *) printf '%s' "$key" ;;
+        esac
+    else
+        printf '%s' "$template"
+    fi
+}
+
+format_message() {
+    local lang="$1"
+    local key="$2"
+    local template
+    shift 2
+    template="$(message_template "$lang" "$key")"
+    # shellcheck disable=SC2059
+    printf "$template" "$@"
+}
+
+msg() {
+    format_message "$ACTIVE_LANGUAGE" "$@"
+}
+
+set_active_language "$OPENVPN_WATCHDOG_LANGUAGE"
+
+# -----------------------------------------------------------------------------
 # Argument parser
 # -----------------------------------------------------------------------------
-# Supports a small set of safe operational flags.  The default mode is a single
+# Supports a small set of safe operational flags. The default mode is a single
 # check cycle, suitable for systemd timer or cron.
 show_help() {
-    cat <<HELP
-openvpn-watchdog ${VERSION}
-
-Usage:
-  ${SCRIPT_NAME} [--config FILE] [--dry-run] [--help] [--version]
-
-Options:
-  --config FILE   Use another config file instead of ${DEFAULT_CONFIG_FILE}
-  --dry-run       Do all checks but do not restart services and do not call hooks
-  --help          Show this help
-  --version       Show version
-HELP
+    format_message "$ACTIVE_LANGUAGE" help_text "$VERSION" "$SCRIPT_NAME" "$DEFAULT_CONFIG_FILE"
+    printf '\n'
 }
+
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --config)
             if [ -z "${2:-}" ]; then
-                echo "ERROR: --config requires a file path" >&2
+                echo "$(msg error_option_requires_value --config)" >&2
                 exit 2
             fi
             CONFIG_FILE="$2"
@@ -56,6 +167,16 @@ while [ "$#" -gt 0 ]; do
         --dry-run)
             DRY_RUN="YES"
             shift
+            ;;
+        --language)
+            if [ -z "${2:-}" ]; then
+                echo "$(msg error_option_requires_value --language)" >&2
+                exit 2
+            fi
+            OPENVPN_WATCHDOG_LANGUAGE="$2"
+            CLI_LANGUAGE_SET="YES"
+            set_active_language "$OPENVPN_WATCHDOG_LANGUAGE"
+            shift 2
             ;;
         --help|-h)
             show_help
@@ -66,12 +187,12 @@ while [ "$#" -gt 0 ]; do
             exit 0
             ;;
         *)
-            echo "ERROR: unknown argument: $1" >&2
+            echo "$(msg error_unknown_argument "$1")" >&2
             show_help >&2
             exit 2
             ;;
     esac
- done
+done
 
 # -----------------------------------------------------------------------------
 # Defaults
@@ -87,9 +208,25 @@ PING_TIMEOUT=3
 DEFAULT_RESTART_CYCLES=3
 RESTART_COOLDOWN_SECONDS=60
 
+# Internet availability guard.
+#   INTERNET_CHECK_METHOD=auto  -> try HTTP targets first, then ping targets.
+#   INTERNET_CHECK_METHOD=http  -> use only HTTP(S) targets through curl.
+#   INTERNET_CHECK_METHOD=ping  -> use only ICMP ping targets.
 INTERNET_CHECK_ENABLED="YES"
+INTERNET_CHECK_METHOD="auto"
 PING_SERVER_INT="8.8.8.8,1.1.1.1"
+HTTP_SERVER_INT="https://www.google.com,https://cloudflare.com"
+# VPN CLIENT ping checks may be skipped while the global Internet check fails.
 SKIP_CLIENT_PING_WHEN_INTERNET_DOWN="YES"
+# Backward-compatible alias from early 0.2.0 configs.
+SKIP_CLIENT_CONNECTIVITY_WHEN_INTERNET_DOWN=""
+
+# HTTP(S) connectivity settings are used only by the global Internet check.
+# VPN CLIENT profiles intentionally use ICMP ping= only.
+HTTP_CONNECT_TIMEOUT=8
+HTTP_MAX_TIME=12
+HTTP_IP_VERSION="4"       # 4, 6, or auto
+HTTP_REQUEST_METHOD="HEAD" # HEAD or GET
 
 NOTIFICATIONS_ENABLED="NO"
 NOTIFY_SCRIPT=""
@@ -100,17 +237,21 @@ LOG_ANALYSIS_LINES=120
 LOG_ANALYSIS_MAX_MATCHES=5
 LOG_ANALYSIS_PATTERNS="AUTH_FAILED|TLS Error|Inactivity timeout|Connection reset|Cannot resolve host address|VERIFY ERROR|Options error|Exiting due to fatal error"
 
-# Empty by default.  The config file should define this array.
+# Empty by default. The config file should define this array.
 declare -a OPENVPN_PROFILES=()
 
 # -----------------------------------------------------------------------------
 # Logging helpers
 # -----------------------------------------------------------------------------
 # save_log writes a human-readable daily log and mirrors the message to stdout.
-# emit_event writes a machine-readable event log and can call the notification
-# hook.  Future Matrix/Email integrations should consume emit_event/hook output,
-# not parse random console text.
+# emit_event_i18n writes a machine-readable event log and can call the
+# notification hook. Future Matrix/Email integrations should consume the event
+# data and hook environment variables, not parse random console text.
 ensure_dirs() {
+    if [ "$DRY_RUN" = "YES" ]; then
+        return 0
+    fi
+
     mkdir -p "$LOG_DIR" "$STATE_DIR"
 }
 
@@ -122,6 +263,13 @@ save_log() {
     local level="$1"
     local message="$2"
     local line
+
+    if [ "$DRY_RUN" = "YES" ]; then
+        line="$(date '+%Y-%m-%d %H:%M:%S') [$level] [DRY-RUN] $message"
+        echo "$line"
+        return 0
+    fi
+
     line="$(date '+%Y-%m-%d %H:%M:%S') [$level] $message"
     echo "$line" >> "$(log_file_for_today)"
     echo "$line"
@@ -136,37 +284,43 @@ event_escape() {
     printf '%s' "$value"
 }
 
-emit_event() {
+emit_event_raw() {
     local severity="$1"
     local profile="$2"
     local profile_type="$3"
     local service_name="$4"
     local event_name="$5"
     local message="$6"
+    local message_en="${7:-$6}"
+    local message_uk="${8:-$6}"
     local now
     local event_log
 
     now="$(date '+%Y-%m-%dT%H:%M:%S%z')"
     event_log="${LOG_DIR}/events.log"
 
-    printf '%s\tseverity=%s\tprofile=%s\ttype=%s\tservice=%s\tevent=%s\tmessage=%s\n' \
+    if [ "$DRY_RUN" = "YES" ]; then
+        save_log "$severity" "[$profile][$event_name] $message"
+        return 0
+    fi
+
+    printf '%s\tseverity=%s\tprofile=%s\ttype=%s\tservice=%s\tevent=%s\tlanguage=%s\tmessage=%s
+' \
         "$now" \
         "$(event_escape "$severity")" \
         "$(event_escape "$profile")" \
         "$(event_escape "$profile_type")" \
         "$(event_escape "$service_name")" \
         "$(event_escape "$event_name")" \
+        "$(event_escape "$ACTIVE_LANGUAGE")" \
         "$(event_escape "$message")" >> "$event_log"
 
     save_log "$severity" "[$profile][$event_name] $message"
 
     # Notification hook contract:
-    #   The hook receives useful data in environment variables.  It may later be
-    #   implemented as Email, Matrix, Telegram, monitoring API, etc.
-    #   In --dry-run mode hooks are never executed.
-    if [ "$DRY_RUN" = "YES" ]; then
-        return 0
-    fi
+    #   The hook receives active-language text plus English/Ukrainian variants.
+    #   It may later be implemented as Email, Matrix, Telegram, monitoring API,
+    #   etc. In --dry-run mode hooks are never executed.
     if [ "$NOTIFICATIONS_ENABLED" = "YES" ] && [ -n "$NOTIFY_SCRIPT" ]; then
         if [ -x "$NOTIFY_SCRIPT" ]; then
             OPENVPN_WATCHDOG_TIME="$now" \
@@ -175,17 +329,44 @@ emit_event() {
             OPENVPN_WATCHDOG_TYPE="$profile_type" \
             OPENVPN_WATCHDOG_SERVICE="$service_name" \
             OPENVPN_WATCHDOG_EVENT="$event_name" \
+            OPENVPN_WATCHDOG_LANGUAGE="$ACTIVE_LANGUAGE" \
             OPENVPN_WATCHDOG_MESSAGE="$message" \
+            OPENVPN_WATCHDOG_MESSAGE_EN="$message_en" \
+            OPENVPN_WATCHDOG_MESSAGE_UK="$message_uk" \
             OPENVPN_WATCHDOG_LOG_FILE="$(log_file_for_today)" \
             OPENVPN_WATCHDOG_EVENT_LOG="$event_log" \
-                "$NOTIFY_SCRIPT" || save_log "WARNING" "Notification hook failed: $NOTIFY_SCRIPT"
+                "$NOTIFY_SCRIPT" || save_log "WARNING" "$(msg notification_hook_failed "$NOTIFY_SCRIPT")"
         else
-            save_log "WARNING" "Notification hook is configured but not executable: $NOTIFY_SCRIPT"
+            save_log "WARNING" "$(msg notification_hook_not_executable "$NOTIFY_SCRIPT")"
         fi
     fi
 }
 
+emit_event_i18n() {
+    local severity="$1"
+    local profile="$2"
+    local profile_type="$3"
+    local service_name="$4"
+    local event_name="$5"
+    local message_key="$6"
+    shift 6
+
+    local message
+    local message_en
+    local message_uk
+
+    message="$(format_message "$ACTIVE_LANGUAGE" "$message_key" "$@")"
+    message_en="$(format_message "en" "$message_key" "$@")"
+    message_uk="$(format_message "uk" "$message_key" "$@")"
+
+    emit_event_raw "$severity" "$profile" "$profile_type" "$service_name" "$event_name" "$message" "$message_en" "$message_uk"
+}
+
 cleanup_old_logs() {
+    if [ "$DRY_RUN" = "YES" ]; then
+        return 0
+    fi
+
     if [ "${LOG_RETENTION_DAYS:-0}" -gt 0 ]; then
         find "$LOG_DIR" -type f -mtime +"$LOG_RETENTION_DAYS" -print0 2>/dev/null | xargs -0 --no-run-if-empty rm -f
     fi
@@ -197,13 +378,17 @@ cleanup_old_logs() {
 load_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
         ensure_dirs
-        save_log "ERROR" "Configuration file not found: $CONFIG_FILE"
+        save_log "ERROR" "$(msg error_config_not_found "$CONFIG_FILE")"
         exit 1
     fi
 
     # shellcheck source=/etc/openvpn-watchdog.conf
     source "$CONFIG_FILE"
 
+    if [ "$CLI_LANGUAGE_SET" != "YES" ]; then
+        set_active_language "${OPENVPN_WATCHDOG_LANGUAGE:-auto}"
+    fi
+    normalize_internet_method
     ensure_dirs
     cleanup_old_logs
 }
@@ -211,6 +396,27 @@ load_config() {
 normalize_type() {
     local value="$1"
     printf '%s' "${value^^}"
+}
+
+normalize_method() {
+    local value="${1:-auto}"
+    value="${value,,}"
+    case "$value" in
+        auto|ping|http)
+            printf '%s' "$value"
+            ;;
+        *)
+            printf 'auto'
+            ;;
+    esac
+}
+
+normalize_internet_method() {
+    local original="${INTERNET_CHECK_METHOD:-auto}"
+    INTERNET_CHECK_METHOD="$(normalize_method "$original")"
+    if [ "${original,,}" != "$INTERNET_CHECK_METHOD" ]; then
+        save_log "WARNING" "$(msg invalid_internet_method "$original")"
+    fi
 }
 
 safe_id() {
@@ -226,31 +432,49 @@ is_systemd_available() {
 # -----------------------------------------------------------------------------
 # State helpers
 # -----------------------------------------------------------------------------
-# Each profile has its own state file.  This prevents one broken VPN from
+# Each profile has its own state file. This prevents one broken VPN from
 # affecting counters or recovery detection for another VPN.
 load_profile_state() {
     local profile_id="$1"
 
     PROFILE_STATE_FILE="${STATE_DIR}/${profile_id}.state"
     SERVICE_FAIL_COUNT=0
-    PING_FAIL_COUNT=0
+    CONNECTIVITY_FAIL_COUNT=0
+    PING_FAIL_COUNT=0 # kept for compatibility with old state files
     LAST_SERVICE_RESULT="unknown"
-    LAST_PING_RESULT="unknown"
+    LAST_CONNECTIVITY_RESULT="unknown"
+    LAST_PING_RESULT="unknown" # kept for compatibility with old state files
     LAST_RESTART_EPOCH=0
     LAST_LOG_SIGNATURE=""
+
+    # Dry-run must be repeatable and read-only. It intentionally ignores
+    # persisted counters so a test run does not show confusing old cycles.
+    if [ "$DRY_RUN" = "YES" ]; then
+        return 0
+    fi
 
     if [ -f "$PROFILE_STATE_FILE" ]; then
         # shellcheck disable=SC1090
         source "$PROFILE_STATE_FILE"
+        if [ "${LAST_CONNECTIVITY_RESULT:-unknown}" = "unknown" ] && [ "${LAST_PING_RESULT:-unknown}" != "unknown" ]; then
+            LAST_CONNECTIVITY_RESULT="$LAST_PING_RESULT"
+        fi
+        if [ "${CONNECTIVITY_FAIL_COUNT:-0}" -eq 0 ] && [ "${PING_FAIL_COUNT:-0}" -gt 0 ]; then
+            CONNECTIVITY_FAIL_COUNT="$PING_FAIL_COUNT"
+        fi
     fi
 }
 
 save_profile_state() {
+    if [ "$DRY_RUN" = "YES" ]; then
+        return 0
+    fi
+
     cat > "$PROFILE_STATE_FILE" <<STATE
 SERVICE_FAIL_COUNT=$(printf '%q' "$SERVICE_FAIL_COUNT")
-PING_FAIL_COUNT=$(printf '%q' "$PING_FAIL_COUNT")
+CONNECTIVITY_FAIL_COUNT=$(printf '%q' "$CONNECTIVITY_FAIL_COUNT")
 LAST_SERVICE_RESULT=$(printf '%q' "$LAST_SERVICE_RESULT")
-LAST_PING_RESULT=$(printf '%q' "$LAST_PING_RESULT")
+LAST_CONNECTIVITY_RESULT=$(printf '%q' "$LAST_CONNECTIVITY_RESULT")
 LAST_RESTART_EPOCH=$(printf '%q' "$LAST_RESTART_EPOCH")
 LAST_LOG_SIGNATURE=$(printf '%q' "$LAST_LOG_SIGNATURE")
 STATE
@@ -261,6 +485,11 @@ load_global_state() {
     LAST_INTERNET_RESULT="unknown"
     INTERNET_FAIL_COUNT=0
 
+    # Dry-run must not depend on previous persistent counters.
+    if [ "$DRY_RUN" = "YES" ]; then
+        return 0
+    fi
+
     if [ -f "$GLOBAL_STATE_FILE" ]; then
         # shellcheck disable=SC1090
         source "$GLOBAL_STATE_FILE"
@@ -268,6 +497,10 @@ load_global_state() {
 }
 
 save_global_state() {
+    if [ "$DRY_RUN" = "YES" ]; then
+        return 0
+    fi
+
     cat > "$GLOBAL_STATE_FILE" <<STATE
 LAST_INTERNET_RESULT=$(printf '%q' "$LAST_INTERNET_RESULT")
 INTERNET_FAIL_COUNT=$(printf '%q' "$INTERNET_FAIL_COUNT")
@@ -275,13 +508,25 @@ STATE
 }
 
 # -----------------------------------------------------------------------------
-# Ping helpers
+# Connectivity helpers: ICMP ping and HTTP(S) curl
 # -----------------------------------------------------------------------------
-# ping_targets accepts a comma-separated list.  It returns success when at least
-# one target answers.  This is useful when a VPN has two possible internal hosts.
+# Comma-separated target lists return success when at least one target works.
+# This avoids false positives when one public endpoint is temporarily blocked.
+trim_spaces() {
+    local value="$1"
+    value="${value#${value%%[![:space:]]*}}"
+    value="${value%${value##*[![:space:]]}}"
+    printf '%s' "$value"
+}
+
+has_csv_targets() {
+    local targets="${1// /}"
+    [ -n "$targets" ]
+}
+
 ping_one_target() {
     local target="$1"
-    target="${target// /}"
+    target="$(trim_spaces "$target")"
 
     if [ -z "$target" ]; then
         return 1
@@ -308,6 +553,139 @@ ping_targets() {
     return "$result"
 }
 
+curl_one_target() {
+    local url="$1"
+    local method
+    local ip_version
+    local -a curl_args
+
+    url="$(trim_spaces "$url")"
+    if [ -z "$url" ]; then
+        return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        return 127
+    fi
+
+    method="${HTTP_REQUEST_METHOD^^}"
+    ip_version="${HTTP_IP_VERSION,,}"
+    curl_args=(-sS -o /dev/null --connect-timeout "$HTTP_CONNECT_TIMEOUT" --max-time "$HTTP_MAX_TIME")
+
+    case "$ip_version" in
+        4|ipv4)
+            curl_args=(-4 "${curl_args[@]}")
+            ;;
+        6|ipv6)
+            curl_args=(-6 "${curl_args[@]}")
+            ;;
+        auto|any|"")
+            ;;
+        *)
+            curl_args=(-4 "${curl_args[@]}")
+            ;;
+    esac
+
+    if [ "$method" = "GET" ]; then
+        curl "${curl_args[@]}" "$url" >/dev/null 2>&1
+    else
+        curl -I "${curl_args[@]}" "$url" >/dev/null 2>&1
+    fi
+}
+
+http_targets() {
+    local targets_csv="$1"
+    local old_ifs="$IFS"
+    local target
+    local result=1
+    local curl_missing=0
+
+    IFS=','
+    for target in $targets_csv; do
+        if curl_one_target "$target"; then
+            result=0
+            break
+        else
+            if [ "$?" -eq 127 ]; then
+                curl_missing=1
+            fi
+        fi
+    done
+    IFS="$old_ifs"
+
+    if [ "$result" -ne 0 ] && [ "$curl_missing" -eq 1 ]; then
+        return 127
+    fi
+    return "$result"
+}
+
+connectivity_description() {
+    local method="$1"
+    local ping_csv="$2"
+    local http_csv="$3"
+
+    case "$method" in
+        ping)
+            printf 'ping=%s' "$ping_csv"
+            ;;
+        http)
+            printf 'http=%s' "$http_csv"
+            ;;
+        *)
+            local sep=""
+            if has_csv_targets "$http_csv"; then
+                printf 'http=%s' "$http_csv"
+                sep=' '
+            fi
+            if has_csv_targets "$ping_csv"; then
+                printf '%sping=%s' "$sep" "$ping_csv"
+            fi
+            ;;
+    esac
+}
+
+check_connectivity_targets() {
+    local method="$1"
+    local ping_csv="$2"
+    local http_csv="$3"
+    local http_result=1
+    local ping_result=1
+
+    method="$(normalize_method "$method")"
+
+    case "$method" in
+        http)
+            has_csv_targets "$http_csv" || return 1
+            http_targets "$http_csv"
+            ;;
+        ping)
+            has_csv_targets "$ping_csv" || return 1
+            ping_targets "$ping_csv"
+            ;;
+        auto|*)
+            # Prefer HTTP in auto mode because many providers/firewalls block
+            # ICMP. If HTTP is not configured or fails, fall back to ping.
+            if has_csv_targets "$http_csv"; then
+                http_targets "$http_csv"
+                http_result=$?
+                if [ "$http_result" -eq 0 ]; then
+                    return 0
+                fi
+            fi
+            if has_csv_targets "$ping_csv"; then
+                ping_targets "$ping_csv"
+                ping_result=$?
+                if [ "$ping_result" -eq 0 ]; then
+                    return 0
+                fi
+            fi
+            if [ "$http_result" -eq 127 ]; then
+                return 127
+            fi
+            return 1
+            ;;
+    esac
+}
+
 check_internet() {
     INTERNET_OK="unknown"
 
@@ -318,20 +696,30 @@ check_internet() {
 
     load_global_state
 
-    if ping_targets "$PING_SERVER_INT"; then
+    local target_description
+    local check_result
+    target_description="$(connectivity_description "$INTERNET_CHECK_METHOD" "$PING_SERVER_INT" "$HTTP_SERVER_INT")"
+
+    check_connectivity_targets "$INTERNET_CHECK_METHOD" "$PING_SERVER_INT" "$HTTP_SERVER_INT"
+    check_result=$?
+
+    if [ "$check_result" -eq 0 ]; then
         INTERNET_OK="YES"
         INTERNET_FAIL_COUNT=0
         if [ "$LAST_INTERNET_RESULT" != "available" ]; then
-            emit_event "INFO" "GLOBAL" "GLOBAL" "-" "internet_available" "Internet connectivity is available: $PING_SERVER_INT"
+            emit_event_i18n "INFO" "GLOBAL" "GLOBAL" "-" "internet_available" internet_available "$INTERNET_CHECK_METHOD" "$target_description"
         fi
         LAST_INTERNET_RESULT="available"
     else
         INTERNET_OK="NO"
         INTERNET_FAIL_COUNT=$((INTERNET_FAIL_COUNT + 1))
+        if [ "$check_result" -eq 127 ]; then
+            emit_event_i18n "ERROR" "GLOBAL" "GLOBAL" "-" "curl_missing" curl_missing "$INTERNET_CHECK_METHOD"
+        fi
         if [ "$LAST_INTERNET_RESULT" != "unavailable" ]; then
-            emit_event "WARNING" "GLOBAL" "GLOBAL" "-" "internet_unavailable" "Internet connectivity check failed: $PING_SERVER_INT. OpenVPN client ping restarts will be skipped while Internet is down."
+            emit_event_i18n "WARNING" "GLOBAL" "GLOBAL" "-" "internet_unavailable" internet_unavailable "$INTERNET_CHECK_METHOD" "$target_description"
         else
-            save_log "WARNING" "[GLOBAL][internet_unavailable] Internet is still unavailable. Failure cycle: ${INTERNET_FAIL_COUNT}"
+            save_log "WARNING" "[GLOBAL][internet_unavailable] $(msg internet_still_unavailable "$INTERNET_FAIL_COUNT")"
         fi
         LAST_INTERNET_RESULT="unavailable"
     fi
@@ -375,7 +763,7 @@ service_is_active() {
     if is_systemd_available; then
         systemctl is-active --quiet "$service_name"
     else
-        # Non-systemd support is intentionally conservative.  Old systems often
+        # Non-systemd support is intentionally conservative. Old systems often
         # manage all OpenVPN profiles through one init script, so only generic
         # status is available.
         /sbin/service openvpn status >/dev/null 2>&1
@@ -395,33 +783,32 @@ restart_service() {
         local since_last_restart
         since_last_restart=$((now_epoch - LAST_RESTART_EPOCH))
         if [ "$since_last_restart" -lt "$RESTART_COOLDOWN_SECONDS" ]; then
-            emit_event "WARNING" "$profile_name" "$profile_type" "$service_name" "restart_skipped_cooldown" "Restart skipped because cooldown is active (${since_last_restart}/${RESTART_COOLDOWN_SECONDS}s). Reason: $reason"
+            emit_event_i18n "WARNING" "$profile_name" "$profile_type" "$service_name" "restart_skipped_cooldown" restart_skipped_cooldown "$since_last_restart" "$RESTART_COOLDOWN_SECONDS" "$reason"
             return 0
         fi
     fi
 
-    emit_event "WARNING" "$profile_name" "$profile_type" "$service_name" "restart_requested" "Restarting service. Reason: $reason"
+    emit_event_i18n "WARNING" "$profile_name" "$profile_type" "$service_name" "restart_requested" restart_requested "$reason"
 
     if [ "$DRY_RUN" = "YES" ]; then
-        save_log "INFO" "[$profile_name][dry_run] Would restart: $service_name"
-        LAST_RESTART_EPOCH="$now_epoch"
+        save_log "INFO" "[$profile_name][dry_run] $(msg dry_run_would_restart "$service_name")"
         return 0
     fi
 
     if is_systemd_available; then
         if systemctl restart "$service_name"; then
             LAST_RESTART_EPOCH="$now_epoch"
-            emit_event "INFO" "$profile_name" "$profile_type" "$service_name" "restart_done" "Service restarted successfully"
+            emit_event_i18n "INFO" "$profile_name" "$profile_type" "$service_name" "restart_done" restart_done
         else
-            emit_event "ERROR" "$profile_name" "$profile_type" "$service_name" "restart_failed" "systemctl restart failed"
+            emit_event_i18n "ERROR" "$profile_name" "$profile_type" "$service_name" "restart_failed" restart_failed_systemctl
             return 1
         fi
     else
         if /sbin/service openvpn restart; then
             LAST_RESTART_EPOCH="$now_epoch"
-            emit_event "INFO" "$profile_name" "$profile_type" "$service_name" "restart_done" "Generic OpenVPN init service restarted successfully"
+            emit_event_i18n "INFO" "$profile_name" "$profile_type" "$service_name" "restart_done" restart_done_init
         else
-            emit_event "ERROR" "$profile_name" "$profile_type" "$service_name" "restart_failed" "Generic OpenVPN init restart failed"
+            emit_event_i18n "ERROR" "$profile_name" "$profile_type" "$service_name" "restart_failed" restart_failed_init
             return 1
         fi
     fi
@@ -430,9 +817,9 @@ restart_service() {
 # -----------------------------------------------------------------------------
 # Log analysis
 # -----------------------------------------------------------------------------
-# This is intentionally small and safe.  It does not make restart decisions by
-# itself yet.  It only records useful events when common OpenVPN error patterns
-# appear near the problem time.  Later Email/Matrix notifications can use these
+# This is intentionally small and safe. It does not make restart decisions by
+# itself yet. It only records useful events when common OpenVPN error patterns
+# appear near the problem time. Later Email/Matrix notifications can use these
 # structured events.
 analyze_service_logs() {
     local profile_name="$1"
@@ -474,7 +861,7 @@ analyze_service_logs() {
     count="$(printf '%s\n' "$matches" | grep -c '^' || true)"
     first_line="$(printf '%s\n' "$matches" | head -n 1)"
 
-    emit_event "WARNING" "$profile_name" "$profile_type" "$service_name" "log_pattern_detected" "Found ${count} matching OpenVPN log line(s) after ${reason}. First match: ${first_line}"
+    emit_event_i18n "WARNING" "$profile_name" "$profile_type" "$service_name" "log_pattern_detected" log_pattern_detected "$count" "$reason" "$first_line"
 }
 
 # -----------------------------------------------------------------------------
@@ -484,10 +871,14 @@ analyze_service_logs() {
 #   "name=office type=CLIENT ping=10.8.0.1 restart_cycles=3"
 #   "name=main type=SERVER restart_cycles=3"
 #
+# Important:
+#   HTTP(S) checks are supported only for the global INTERNET_CHECK.
+#   VPN CLIENT profiles use ping= only because the tunnel itself must pass ICMP.
+#
 # Optional:
 #   service=openvpn-client@custom.service
 #
-# Values should not contain spaces.  This keeps the config readable and avoids
+# Values should not contain spaces. This keeps the config readable and avoids
 # unsafe eval parsing.
 parse_profile() {
     local profile_def="$1"
@@ -514,6 +905,9 @@ parse_profile() {
             ping)
                 PROFILE_PING="$value"
                 ;;
+            http|url)
+                save_log "WARNING" "$(msg profile_http_unsupported "${PROFILE_NAME:-unknown}" "$key")"
+                ;;
             service)
                 PROFILE_SERVICE="$value"
                 ;;
@@ -521,21 +915,21 @@ parse_profile() {
                 PROFILE_RESTART_CYCLES="$value"
                 ;;
             *)
-                save_log "WARNING" "Unknown profile parameter '$key' in: $profile_def"
+                save_log "WARNING" "$(msg unknown_profile_parameter "$key" "$profile_def")"
                 ;;
         esac
     done
 
     if [ -z "$PROFILE_NAME" ]; then
-        save_log "ERROR" "Profile has no name: $profile_def"
+        save_log "ERROR" "$(msg profile_no_name "$profile_def")"
         return 1
     fi
     if [ "$PROFILE_TYPE" != "SERVER" ] && [ "$PROFILE_TYPE" != "CLIENT" ]; then
-        save_log "ERROR" "Profile '$PROFILE_NAME' has invalid type '$PROFILE_TYPE'. Allowed: SERVER or CLIENT"
+        save_log "ERROR" "$(msg invalid_profile_type "$PROFILE_NAME" "$PROFILE_TYPE")"
         return 1
     fi
     if ! [[ "$PROFILE_RESTART_CYCLES" =~ ^[0-9]+$ ]] || [ "$PROFILE_RESTART_CYCLES" -lt 1 ]; then
-        save_log "WARNING" "Profile '$PROFILE_NAME' has invalid restart_cycles='$PROFILE_RESTART_CYCLES'. Using default: $DEFAULT_RESTART_CYCLES"
+        save_log "WARNING" "$(msg invalid_restart_cycles "$PROFILE_NAME" "$PROFILE_RESTART_CYCLES" "$DEFAULT_RESTART_CYCLES")"
         PROFILE_RESTART_CYCLES="$DEFAULT_RESTART_CYCLES"
     fi
 
@@ -546,6 +940,8 @@ process_profile() {
     local profile_def="$1"
     local profile_id
     local service_name
+    local vpn_ping_description
+    local ping_result
 
     if ! parse_profile "$profile_def"; then
         return 1
@@ -555,70 +951,83 @@ process_profile() {
     load_profile_state "$profile_id"
 
     if ! service_name="$(build_service_name "$PROFILE_NAME" "$PROFILE_TYPE" "$PROFILE_SERVICE")"; then
-        emit_event "ERROR" "$PROFILE_NAME" "$PROFILE_TYPE" "-" "invalid_service_name" "Could not build OpenVPN service name"
+        emit_event_i18n "ERROR" "$PROFILE_NAME" "$PROFILE_TYPE" "-" "invalid_service_name" invalid_service_name
         save_profile_state
         return 1
     fi
 
     # 1) SERVER and CLIENT: service must be active.
-    #    If the service is down, restart immediately.  Ping is not useful until
-    #    the service itself is healthy.
+    #    If the service is down, restart immediately. Connectivity checks are
+    #    not useful until the service itself is healthy.
     if service_is_active "$service_name"; then
         SERVICE_FAIL_COUNT=0
         if [ "$LAST_SERVICE_RESULT" != "active" ]; then
-            emit_event "INFO" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "service_active" "Service is active"
+            emit_event_i18n "INFO" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "service_active" service_active
         fi
         LAST_SERVICE_RESULT="active"
     else
         SERVICE_FAIL_COUNT=$((SERVICE_FAIL_COUNT + 1))
         LAST_SERVICE_RESULT="inactive"
-        emit_event "ERROR" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "service_inactive" "Service is not active. Failure cycle: ${SERVICE_FAIL_COUNT}"
+        emit_event_i18n "ERROR" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "service_inactive" service_inactive "$SERVICE_FAIL_COUNT"
         analyze_service_logs "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "service_inactive"
-        restart_service "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "service is not active"
+        restart_service "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "$(msg reason_service_inactive)"
         save_profile_state
         return 0
     fi
 
-    # 2) SERVER: service check is enough.  No ping by default.
+    # 2) SERVER: service check is enough. VPN ping targets are ignored to avoid
+    #    false alarms when no clients are connected.
     if [ "$PROFILE_TYPE" = "SERVER" ]; then
-        PING_FAIL_COUNT=0
-        LAST_PING_RESULT="not_required"
+        CONNECTIVITY_FAIL_COUNT=0
+        LAST_CONNECTIVITY_RESULT="not_required"
+        if has_csv_targets "$PROFILE_PING"; then
+            emit_event_i18n "WARNING" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "server_ping_ignored" server_ping_ignored "$PROFILE_PING"
+        fi
         save_profile_state
         return 0
     fi
 
     # 3) CLIENT without ping=: only service is watched.
-    if [ -z "$PROFILE_PING" ]; then
-        PING_FAIL_COUNT=0
-        LAST_PING_RESULT="not_configured"
+    if ! has_csv_targets "$PROFILE_PING"; then
+        CONNECTIVITY_FAIL_COUNT=0
+        LAST_CONNECTIVITY_RESULT="not_configured"
         save_profile_state
         return 0
     fi
 
-    # 4) CLIENT with ping=: check VPN-side availability.
+    # 4) CLIENT with ping=: check VPN-side availability using ICMP only.
+    #    HTTP(S)/curl checks are intentionally limited to INTERNET_CHECK.
     #    If global Internet is down, avoid restarting all clients just because
     #    the host has no outside connectivity.
-    if [ "$INTERNET_OK" = "NO" ] && [ "$SKIP_CLIENT_PING_WHEN_INTERNET_DOWN" = "YES" ]; then
-        emit_event "WARNING" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "client_ping_skipped" "Client VPN ping check skipped because Internet check failed"
+    local skip_when_down="${SKIP_CLIENT_PING_WHEN_INTERNET_DOWN:-YES}"
+    if [ -n "${SKIP_CLIENT_CONNECTIVITY_WHEN_INTERNET_DOWN:-}" ]; then
+        skip_when_down="$SKIP_CLIENT_CONNECTIVITY_WHEN_INTERNET_DOWN"
+    fi
+    if [ "$INTERNET_OK" = "NO" ] && [ "$skip_when_down" = "YES" ]; then
+        emit_event_i18n "WARNING" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "client_ping_skipped" client_ping_skipped
         save_profile_state
         return 0
     fi
 
-    if ping_targets "$PROFILE_PING"; then
-        PING_FAIL_COUNT=0
-        if [ "$LAST_PING_RESULT" != "available" ]; then
-            emit_event "INFO" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "vpn_ping_available" "VPN target is available: $PROFILE_PING"
+    vpn_ping_description="ping=$PROFILE_PING"
+    ping_targets "$PROFILE_PING"
+    ping_result=$?
+
+    if [ "$ping_result" -eq 0 ]; then
+        CONNECTIVITY_FAIL_COUNT=0
+        if [ "$LAST_CONNECTIVITY_RESULT" != "available" ]; then
+            emit_event_i18n "INFO" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "vpn_ping_available" vpn_ping_available "$vpn_ping_description"
         fi
-        LAST_PING_RESULT="available"
+        LAST_CONNECTIVITY_RESULT="available"
     else
-        PING_FAIL_COUNT=$((PING_FAIL_COUNT + 1))
-        LAST_PING_RESULT="unavailable"
-        emit_event "WARNING" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "vpn_ping_unavailable" "VPN target is unavailable: $PROFILE_PING. Failure cycle: ${PING_FAIL_COUNT}/${PROFILE_RESTART_CYCLES}"
+        CONNECTIVITY_FAIL_COUNT=$((CONNECTIVITY_FAIL_COUNT + 1))
+        LAST_CONNECTIVITY_RESULT="unavailable"
+        emit_event_i18n "WARNING" "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "vpn_ping_unavailable" vpn_ping_unavailable "$vpn_ping_description" "$CONNECTIVITY_FAIL_COUNT" "$PROFILE_RESTART_CYCLES"
         analyze_service_logs "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "vpn_ping_unavailable"
 
-        if [ "$PING_FAIL_COUNT" -ge "$PROFILE_RESTART_CYCLES" ]; then
-            restart_service "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "VPN ping target is unavailable: $PROFILE_PING"
-            PING_FAIL_COUNT=0
+        if [ "$CONNECTIVITY_FAIL_COUNT" -ge "$PROFILE_RESTART_CYCLES" ]; then
+            restart_service "$PROFILE_NAME" "$PROFILE_TYPE" "$service_name" "$(msg reason_vpn_ping_unavailable "$vpn_ping_description")"
+            CONNECTIVITY_FAIL_COUNT=0
         fi
     fi
 
@@ -632,12 +1041,12 @@ main() {
     load_config
 
     if [ "${#OPENVPN_PROFILES[@]}" -eq 0 ]; then
-        save_log "ERROR" "No OpenVPN profiles configured. Set OPENVPN_PROFILES in $CONFIG_FILE"
+        save_log "ERROR" "$(msg no_profiles_configured "$CONFIG_FILE")"
         exit 1
     fi
 
     if [ "$(id -u)" -ne 0 ]; then
-        save_log "WARNING" "Script is not running as root. Checks may work, but service restarts will probably fail."
+        save_log "WARNING" "$(msg not_root_warning)"
     fi
 
     check_internet
