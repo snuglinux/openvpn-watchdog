@@ -1,25 +1,28 @@
 # Maintainer: snuglinux <https://github.com/snuglinux>
 
 pkgname=openvpn-watchdog
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
-pkgdesc='Watchdog for multiple OpenVPN profiles with external multilingual message files'
+pkgdesc='Watchdog for multiple OpenVPN profiles with HTTP Internet checks and external multilingual message files'
 arch=('any')
 url='https://github.com/snuglinux/openvpn-watchdog'
 license=('custom')
-depends=('bash' 'curl' 'openvpn' 'systemd')
+depends=('bash' 'curl' 'iputils' 'openvpn' 'systemd')
 conflicts=('auto-restart-openvpn')
 replaces=('auto-restart-openvpn')
 provides=('openvpn-watchdog' 'auto-restart-openvpn')
 backup=('etc/openvpn-watchdog.conf')
 install='openvpn-watchdog.install'
-source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/${pkgver}.tar.gz")
-sha256sums=('SKIP')
+source=("${pkgname}-${pkgver}.zip::${url}/archive/refs/tags/${pkgver}.zip")
+sha256sums=('bbe1642cb08536613766820f0e094f5fb6243dfccf34c17b89c2ccbcf14fcee1')
 
 # IMPORTANT:
 # Replace sha256sums=('SKIP') before publishing to a repository/AUR:
 #   updpkgsums
 #   makepkg --printsrcinfo > .SRCINFO
+#
+# Current source URL for this release:
+#   https://github.com/snuglinux/openvpn-watchdog/archive/refs/tags/0.2.1.zip
 
 package() {
     cd "${srcdir}/${pkgname}-${pkgver}"
@@ -35,7 +38,7 @@ package() {
         install -Dm644 locale/*.conf "${pkgdir}/usr/share/openvpn-watchdog/locale/"
     fi
 
-    # Cron is provided as documentation only.  Arch Linux uses the systemd timer.
+    # Cron is provided as documentation only. Arch Linux uses the systemd timer.
     install -Dm644 openvpn-watchdog.crontab "${pkgdir}/usr/share/doc/openvpn-watchdog/openvpn-watchdog.crontab.example"
 
     install -Dm644 README.md "${pkgdir}/usr/share/doc/openvpn-watchdog/README.md"

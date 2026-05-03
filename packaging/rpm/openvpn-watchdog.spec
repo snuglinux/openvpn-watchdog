@@ -1,17 +1,19 @@
 %{!?_unitdir:%global _unitdir /usr/lib/systemd/system}
 
 Name:           openvpn-watchdog
-Version:        0.2.0
+Version:        0.2.1
 Release:        1%{?dist}
-Summary:        Watchdog for multiple OpenVPN profiles with external multilingual messages
+Summary:        Watchdog for multiple OpenVPN profiles with HTTP checks and multilingual messages
 
 License:        Custom
 URL:            https://github.com/snuglinux/openvpn-watchdog
-Source0:        %{url}/archive/refs/tags/%{version}.tar.gz#/%{name}-%{version}.tar.gz
+Source0:        %{url}/archive/refs/tags/%{version}.zip#/%{name}-%{version}.zip
 
 BuildArch:      noarch
+BuildRequires:  unzip
 Requires:       bash
 Requires:       curl
+Requires:       iputils
 Requires:       openvpn
 Requires(post): systemd
 Requires(preun): systemd
@@ -26,15 +28,15 @@ Provides:       %{name} = %{version}-%{release}
 openvpn-watchdog monitors multiple OpenVPN CLIENT and SERVER profiles on Linux.
 It checks OpenVPN systemd services and can optionally verify VPN client
 connectivity with ICMP ping targets. The global Internet check can use HTTP(S)
-through curl when ICMP is blocked by a provider or firewall. When a problem is
-detected for several consecutive checks, only the affected OpenVPN service is
-restarted.
+through curl when ICMP is blocked by a provider or firewall. Runtime messages are
+loaded from external English/Ukrainian locale files. When a problem is detected
+for several consecutive checks, only the affected OpenVPN service is restarted.
 
 This package does not reboot the host. Automatic host reboot logic is planned as
 a separate system watchdog package.
 
 %prep
-%setup -q
+%setup -q -n %{name}-%{version}
 
 %build
 bash -n openvpn-watchdog
@@ -59,7 +61,7 @@ install -D -m 0644 openvpn-watchdog.timer %{buildroot}%{_unitdir}/openvpn-watchd
 install -D -m 0644 locale/en.conf %{buildroot}%{_datadir}/%{name}/locale/en.conf
 install -D -m 0644 locale/uk.conf %{buildroot}%{_datadir}/%{name}/locale/uk.conf
 
-# Cron is provided as documentation only.  ClearOS/CentOS 7 uses the systemd timer.
+# Cron is provided as documentation only. ClearOS/CentOS 7 uses the systemd timer.
 install -D -m 0644 openvpn-watchdog.crontab %{buildroot}%{_docdir}/%{name}/openvpn-watchdog.crontab.example
 install -D -m 0644 README.md %{buildroot}%{_docdir}/%{name}/README.md
 if [ -f README_uk.md ]; then
@@ -117,13 +119,15 @@ fi
 %dir %{_localstatedir}/log/openvpn-watchdog
 %dir %{_localstatedir}/lib/openvpn-watchdog
 %doc %{_docdir}/%{name}
+%dir %{_datadir}/%{name}
+%dir %{_datadir}/%{name}/locale
 %{_datadir}/%{name}/locale/en.conf
 %{_datadir}/%{name}/locale/uk.conf
 
 %changelog
-* Sun May 03 2026 snuglinux <https://github.com/snuglinux> - 0.2.0-1
-- Add multi-profile OpenVPN watchdog logic.
-- Replace deprecated auto-restart-openvpn package.
-- Add structured event logs and notification hook foundation.
+* Sun May 03 2026 snuglinux <https://github.com/snuglinux> - 0.2.1-1
+- Use the 0.2.1 GitHub ZIP source archive.
 - Add HTTP(S) curl support for global Internet checks.
-- Move English/Ukrainian runtime messages to external locale files.
+- Add external English/Ukrainian locale files.
+- Add curl and iputils runtime dependencies.
+- Replace deprecated auto-restart-openvpn package.

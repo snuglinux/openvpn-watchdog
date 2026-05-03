@@ -1,0 +1,22 @@
+pkgbase = openvpn-watchdog
+	pkgdesc = Watchdog for multiple OpenVPN profiles with HTTP Internet checks and external multilingual message files
+	pkgver = 0.2.1
+	pkgrel = 1
+	url = https://github.com/snuglinux/openvpn-watchdog
+	install = openvpn-watchdog.install
+	arch = any
+	license = custom
+	depends = bash
+	depends = curl
+	depends = iputils
+	depends = openvpn
+	depends = systemd
+	provides = openvpn-watchdog
+	provides = auto-restart-openvpn
+	conflicts = auto-restart-openvpn
+	replaces = auto-restart-openvpn
+	backup = etc/openvpn-watchdog.conf
+	source = openvpn-watchdog-0.2.1.zip::https://github.com/snuglinux/openvpn-watchdog/archive/refs/tags/0.2.1.zip
+	sha256sums = SKIP
+
+pkgname = openvpn-watchdog
