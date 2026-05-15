@@ -125,6 +125,9 @@ fi
 %{_datadir}/%{name}/locale/uk.conf
 
 %changelog
+
+* Sun May 15 2026 snuglinux <https://github.com/snuglinux> - 0.2.2-1
+- Fixed openvpn-watchdog.conf
 * Sun May 03 2026 snuglinux <https://github.com/snuglinux> - 0.2.1-1
 - Use the 0.2.1 GitHub ZIP source archive.
 - Add HTTP(S) curl support for global Internet checks.

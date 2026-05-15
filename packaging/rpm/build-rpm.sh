@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 
 PROJECT="openvpn-watchdog"
-VERSION="0.2.1"
+VERSION="0.2.2"
 RELEASE="1"
 GITHUB_URL="https://github.com/snuglinux/openvpn-watchdog"
 SOURCE_URL="${GITHUB_URL}/archive/refs/tags/${VERSION}.zip"

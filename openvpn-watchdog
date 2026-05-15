@@ -22,7 +22,7 @@
 
 set -o pipefail
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 SCRIPT_NAME="$(basename "$0")"
 DEFAULT_CONFIG_FILE="/etc/openvpn-watchdog.conf"
 CONFIG_FILE="${OPENVPN_WATCHDOG_CONFIG:-$DEFAULT_CONFIG_FILE}"
